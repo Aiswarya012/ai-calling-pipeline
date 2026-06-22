@@ -20,7 +20,7 @@ STT_LANGUAGE = "hi"
 STT_DECODING = "rnnt"
 STT_SAMPLE_RATE = 16_000
 
-LLM_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+LLM_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 LLM_MAX_NEW_TOKENS = 200
 
 TTS_LANG_CODE = "h"
