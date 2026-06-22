@@ -4,6 +4,7 @@ transformers
 accelerate
 bitsandbytes
 kokoro>=0.9.4
+sentence-transformers
 soundfile
 numpy
 onnxruntime

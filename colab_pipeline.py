@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import soundfile as sf
 import torch
 import torchaudio
 from kokoro import KPipeline
+from sentence_transformers import SentenceTransformer
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -20,6 +22,10 @@ STT_LANGUAGE = "hi"
 STT_DECODING = "rnnt"
 STT_SAMPLE_RATE = 16_000
 
+EMBED_MODEL_ID = "intfloat/multilingual-e5-small"
+KNOWLEDGE_PATH = Path(__file__).parent / "knowledge.md"
+RAG_TOP_K = 3
+
 LLM_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 LLM_MAX_NEW_TOKENS = 200
 
@@ -28,10 +34,10 @@ TTS_VOICE = "hf_alpha"
 TTS_SAMPLE_RATE = 24_000
 
 SYSTEM_PROMPT = (
-    "You are a polite Hindi-speaking car showroom assistant. "
-    "Always reply in natural, conversational Hindi. Keep replies short, "
-    "like a phone call. Showroom hours are Monday to Saturday, 10 AM to 7 PM. "
-    "You can help book test-drive and sales appointments."
+    "You are a polite Hindi-speaking assistant for Sharma Motors car showroom. "
+    "Always reply in natural, conversational Hindi. Keep replies short, like a phone call. "
+    "Answer only using the company information provided below. If the information is not "
+    "there, politely say you will check and get back. Write times in words like 'चार बजे'."
 )
 
 
@@ -58,6 +64,29 @@ class IndicConformerSTT:
         return text.strip() if isinstance(text, str) else str(text).strip()
 
 
+class KnowledgeRetriever:
+    def __init__(self, path: Path) -> None:
+        logger.info("Loading embedding model %s", EMBED_MODEL_ID)
+        self._model = SentenceTransformer(EMBED_MODEL_ID)
+        self._chunks = self._load_chunks(path)
+        self._embeddings = self._model.encode(
+            [f"passage: {chunk}" for chunk in self._chunks], normalize_embeddings=True
+        )
+        logger.info("Indexed %d knowledge chunks", len(self._chunks))
+
+    @staticmethod
+    def _load_chunks(path: Path) -> list[str]:
+        text = path.read_text(encoding="utf-8")
+        chunks = [c.strip() for c in re.split(r"\n\s*\n", text) if c.strip()]
+        return [c for c in chunks if not c.startswith("#")]
+
+    def retrieve(self, query: str, k: int = RAG_TOP_K) -> list[str]:
+        query_embedding = self._model.encode([f"query: {query}"], normalize_embeddings=True)
+        scores = (self._embeddings @ query_embedding.T).ravel()
+        top_indices = np.argsort(scores)[::-1][:k]
+        return [self._chunks[i] for i in top_indices]
+
+
 class OpenSourceLLM:
     def __init__(self) -> None:
         logger.info("Loading LLM %s (4-bit)", LLM_MODEL_ID)
@@ -73,9 +102,12 @@ class OpenSourceLLM:
         self._model.eval()
 
     @torch.inference_mode()
-    def reply(self, user_text: str) -> str:
+    def reply(self, user_text: str, context: list[str]) -> str:
+        system = SYSTEM_PROMPT
+        if context:
+            system += "\n\nCompany information:\n" + "\n".join(f"- {c}" for c in context)
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
         prompt = self._tokenizer.apply_chat_template(
@@ -106,6 +138,7 @@ class CallPipeline:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Using device %s", device)
         self._stt = IndicConformerSTT(device)
+        self._kb = KnowledgeRetriever(KNOWLEDGE_PATH)
         self._llm = OpenSourceLLM()
         self._tts = KokoroTTS()
 
@@ -115,7 +148,10 @@ class CallPipeline:
         transcript = self._stt.transcribe(input_path)
         logger.info("STT transcript: %s", transcript)
 
-        reply = self._llm.reply(transcript)
+        context = self._kb.retrieve(transcript)
+        logger.info("Retrieved context: %s", context)
+
+        reply = self._llm.reply(transcript, context)
         logger.info("LLM reply: %s", reply)
 
         audio, sample_rate = self._tts.synthesize(reply)
@@ -126,7 +162,7 @@ class CallPipeline:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="STT -> open-source LLM -> TTS wiring test")
+    parser = argparse.ArgumentParser(description="STT -> RAG -> LLM -> TTS wiring test")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("reply.wav"))
     args = parser.parse_args()
